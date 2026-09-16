@@ -4,7 +4,7 @@ use anchor_spl::{
     token::{Mint, Token, TokenAccount},
 };
 
-use crate::state::Config;
+use crate::{error::AmmError, state::Config};
 
 #[derive(Accounts)]
 #[instruction(seed: u64)]
@@ -13,6 +13,9 @@ pub struct Initialize<'info> {
     pub initializer: Signer<'info>,
     pub mint_x: Account<'info, Mint>,
     pub mint_y: Account<'info, Mint>,
+    /// Wallet that will own the protocol-fee treasury ATAs.
+    /// CHECK: Stored on Config and used only as ATA authority; no data read.
+    pub treasury: UncheckedAccount<'info>,
     #[account(
         init,
         payer = initializer,
@@ -36,6 +39,22 @@ pub struct Initialize<'info> {
         associated_token::authority = config,
     )]
     pub vault_y: Account<'info, TokenAccount>,
+    /// Protocol-fee ATA for mint_x (owned by `treasury`, not the pool).
+    #[account(
+        init,
+        payer = initializer,
+        associated_token::mint = mint_x,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_x: Account<'info, TokenAccount>,
+    /// Protocol-fee ATA for mint_y (owned by `treasury`, not the pool).
+    #[account(
+        init,
+        payer = initializer,
+        associated_token::mint = mint_y,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_y: Account<'info, TokenAccount>,
     #[account(
         init,
         payer = initializer,
@@ -54,15 +73,22 @@ impl<'info> Initialize<'info> {
         &mut self,
         seed: u64,
         fee: u16,
+        protocol_fee: u16,
         authority: Option<Pubkey>,
         bumps: InitializeBumps,
     ) -> Result<()> {
+        // fee is total swap fee in bps; protocol_fee is the cut of that fee (also in bps).
+        require!(fee <= 10_000, AmmError::InvalidFee);
+        require!(protocol_fee <= 10_000, AmmError::InvalidFee);
+
         self.config.set_inner(Config {
             seed,
             authority,
             mint_x: self.mint_x.key(),
             mint_y: self.mint_y.key(),
             fee,
+            protocol_fee,
+            treasury: self.treasury.key(),
             locked: false,
             config_bump: bumps.config,
             lp_bump: bumps.mint_lp,

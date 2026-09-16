@@ -37,6 +37,20 @@ pub struct Swap<'info> {
         associated_token::authority = config,
     )]
     pub vault_y: Box<Account<'info, TokenAccount>>,
+    /// Protocol-fee destination for mint_x (authority = config.treasury).
+    #[account(
+        mut,
+        associated_token::mint = mint_x,
+        associated_token::authority = config.treasury,
+    )]
+    pub treasury_x: Box<Account<'info, TokenAccount>>,
+    /// Protocol-fee destination for mint_y (authority = config.treasury).
+    #[account(
+        mut,
+        associated_token::mint = mint_y,
+        associated_token::authority = config.treasury,
+    )]
+    pub treasury_y: Box<Account<'info, TokenAccount>>,
     #[account(
         mut,
         associated_token::mint = mint_x,
@@ -56,7 +70,12 @@ pub struct Swap<'info> {
 
 impl<'info> Swap<'info> {
     pub fn swap(&mut self, is_x: bool, amount: u64, min: u64) -> Result<()> {
+        require!(!self.config.locked, AmmError::PoolLocked);
         require!(amount > 0, AmmError::InvalidAmount);
+
+        // Curve fee = total swap fee. Output is priced on (amount - fee).
+        // The full `amount` is deposited into the vault; the fee slice would
+        // otherwise stay in the pool (LP fee). We skim a protocol share next.
         let mut curve = ConstantProduct::init(
             self.vault_x.amount,
             self.vault_y.amount,
@@ -64,19 +83,32 @@ impl<'info> Swap<'info> {
             self.config.fee,
             Some(6),
         )
-        .unwrap();
+        .map_err(AmmError::from)?;
 
         let p = match is_x {
             true => LiquidityPair::X,
             false => LiquidityPair::Y,
         };
 
-        let swap_result: constant_product_curve::SwapResult = curve
+        let swap_result = curve
             .swap(p, amount, min)
             .map_err(|_| AmmError::SlippageExceeded)?;
 
+        // protocol_fee is bps of the collected fee (not of amount_in).
+        let protocol_fee_amount = (swap_result.fee as u128)
+            .checked_mul(self.config.protocol_fee as u128)
+            .ok_or(AmmError::Overflow)?
+            .checked_div(10_000)
+            .ok_or(AmmError::Overflow)? as u64;
+
         self.deposit_tokens(is_x, swap_result.deposit)?;
-        self.withdraw_tokens(is_x, swap_result.withdraw)
+        self.withdraw_tokens(is_x, swap_result.withdraw)?;
+
+        if protocol_fee_amount > 0 {
+            self.transfer_protocol_fee(is_x, protocol_fee_amount)?;
+        }
+
+        Ok(())
     }
 
     pub fn deposit_tokens(&mut self, is_x: bool, amount: u64) -> Result<()> {
@@ -105,6 +137,7 @@ impl<'info> Swap<'info> {
     }
 
     pub fn withdraw_tokens(&mut self, is_x: bool, amount: u64) -> Result<()> {
+        // User deposited X → withdraw Y (and vice versa).
         let (from, to) = match is_x {
             true => (
                 self.vault_y.to_account_info(),
@@ -113,6 +146,38 @@ impl<'info> Swap<'info> {
             false => (
                 self.vault_x.to_account_info(),
                 self.user_x.to_account_info(),
+            ),
+        };
+
+        transfer(
+            CpiContext::new_with_signer(
+                self.token_program.key(),
+                Transfer {
+                    from,
+                    to,
+                    authority: self.config.to_account_info(),
+                },
+                &[&[
+                    b"config",
+                    &self.config.seed.to_le_bytes(),
+                    &[self.config.config_bump],
+                ]],
+            ),
+            amount,
+        )
+    }
+
+    /// Move the protocol share of the swap fee from the input vault → treasury.
+    /// The remainder of `swap_result.fee` stays in the vault as the LP fee.
+    pub fn transfer_protocol_fee(&mut self, is_x: bool, amount: u64) -> Result<()> {
+        let (from, to) = match is_x {
+            true => (
+                self.vault_x.to_account_info(),
+                self.treasury_x.to_account_info(),
+            ),
+            false => (
+                self.vault_y.to_account_info(),
+                self.treasury_y.to_account_info(),
             ),
         };
 
